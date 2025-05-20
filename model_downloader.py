@@ -4,7 +4,6 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 from huggingface_hub import login
 import logging
 import time
-from tqdm import tqdm
 
 logging.basicConfig(
     level=logging.INFO,
@@ -104,7 +103,7 @@ def main():
     successful = 0
     failed = 0
     
-    for model_name in tqdm(models_to_download, desc="Downloading models"):
+    for model_name in models_to_download:
         logger.info(f"Processing model: {model_name}")
         
         success = download_model(
