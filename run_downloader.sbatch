@@ -8,4 +8,4 @@
 #SBATCH --account=a-a07
 #SBATCH --output=slurm-%x.out
 
-srun python python model_downloader.py --output-dir /capstor/scratch/cscs/leoplt/models --use-auth --token "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"          
+srun python model_downloader.py --output-dir /capstor/scratch/cscs/leoplt/models --use-auth --token "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"          
