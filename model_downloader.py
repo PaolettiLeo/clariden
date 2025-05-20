@@ -10,7 +10,7 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler("/capstor/scratch/cscs/model_download.log"),
+        logging.FileHandler("/capstor/scratch/cscs/leoplt/model_download.log"),
         logging.StreamHandler()
     ]
 )
