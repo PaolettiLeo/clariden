@@ -16,20 +16,35 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 MODELS = [
+    "mistralai/Mistral-7B-v0.1",
+    "HuggingFaceH4/zephyr-7b-alpha",
     "meta-llama/Llama-2-7b-hf",
+    "meta-llama/Llama-2-13b-hf",
+    "meta-llama/Llama-2-70b-hf",
+    "EleutherAI/pythia-1b",
+    "EleutherAI/pythia-2.8b",
     "EleutherAI/pythia-6.9b",
+    "EleutherAI/pythia-12b",
     "tiiuae/falcon-7b",
-    "bigscience/bloom-7b1",
-    "mistralai/Mistral-7B-v0.1"
+    "tiiuae/falcon-40b",
+    "ContextualAI/archangel_dpo_pythia2-8b",
+    "ContextualAI/archangel_ppo_pythia2-8b"
 ]
 
-# clean directories
 MODEL_TO_DIR = {
+    "mistralai/Mistral-7B-v0.1": "mistral-7b-v0.1",
+    "HuggingFaceH4/zephyr-7b-alpha": "zephyr-7b-alpha",
     "meta-llama/Llama-2-7b-hf": "llama2-7b",
+    "meta-llama/Llama-2-13b-hf": "llama2-13b",
+    "meta-llama/Llama-2-70b-hf": "llama2-70b",
+    "EleutherAI/pythia-1b": "pythia-1b",
+    "EleutherAI/pythia-2.8b": "pythia-2.8b",
     "EleutherAI/pythia-6.9b": "pythia-6.9b",
+    "EleutherAI/pythia-12b": "pythia-12b",
     "tiiuae/falcon-7b": "falcon-7b",
-    "bigscience/bloom-7b1": "bloom-7b1",
-    "mistralai/Mistral-7B-v0.1": "mistral-7b-v0.1"
+    "tiiuae/falcon-40b": "falcon-40b",
+    "ContextualAI/archangel_dpo_pythia2-8b": "archangel-dpo-pythia2-8b",
+    "ContextualAI/archangel_ppo_pythia2-8b": "archangel-ppo-pythia2-8b"
 }
 
 def download_model(model_name, output_dir, use_auth=False, token=None):
