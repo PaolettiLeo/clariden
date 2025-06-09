@@ -3,12 +3,11 @@ import argparse
 import pandas as pd
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 import logging
 import time
 from pathlib import Path
 import gc
-from typing import List, Tuple
 import threading
 import json
 
@@ -44,149 +43,170 @@ class CheckpointManager:
         self.checkpoint_dir.mkdir(exist_ok=True)
 
     def get_checkpoint_path(self, csv_file: str) -> Path:
-        stem = Path(csv_file).stem
-        return self.checkpoint_dir / f"{stem}_checkpoint.json"
+        name = Path(csv_file).stem
+        return self.checkpoint_dir / f"{name}_checkpoint.json"
 
-    def get_temp_csv_path(self, csv_file: str) -> Path:
+    def get_temp_path(self, csv_file: str) -> Path:
         p = Path(csv_file)
-        return p.parent / f"{p.stem}_temp.csv"
+        return p.parent / f"{p.stem}_temp_progress.csv"
 
-    def save(self, csv_file: str, completed: List[str], failed: List[str], df: pd.DataFrame):
-        data = {"csv": csv_file, "done": completed, "failed": failed, "time": time.time()}
-        with open(self.get_checkpoint_path(csv_file), 'w') as f:
-            json.dump(data, f, indent=2)
-        df.to_csv(self.get_temp_csv_path(csv_file), index=False)
-        logger.info(f"Checkpoint saved for {csv_file}: {len(completed)} done")
-
-    def load(self, csv_file: str) -> Tuple[List[str], List[str], pd.DataFrame]:
+    def save_checkpoint(self, csv_file, completed, failed, df):
+        data = {
+            "csv_file": csv_file,
+            "completed_models": completed,
+            "failed_models": failed,
+            "timestamp": time.time(),
+            "total_rows": len(df)
+        }
         cp = self.get_checkpoint_path(csv_file)
-        tmp = self.get_temp_csv_path(csv_file)
+        tmp = self.get_temp_path(csv_file)
+        with open(cp, "w") as f:
+            json.dump(data, f, indent=2)
+        df.to_csv(tmp, index=False)
+        logger.info(f"{len(completed)} models done for {csv_file}")
+
+    def load_checkpoint(self, csv_file):
+        cp = self.get_checkpoint_path(csv_file)
+        tmp = self.get_temp_path(csv_file)
         if not cp.exists() or not tmp.exists():
             return [], [], pd.read_csv(csv_file)
         try:
-            d = json.loads(cp.read_text())
+            with open(cp) as f:
+                data = json.load(f)
             df = pd.read_csv(tmp)
-            return d.get('done', []), d.get('failed', []), df
+            return data.get("completed_models", []), data.get("failed_models", []), df
         except Exception as e:
-            logger.error(f"Failed loading checkpoint: {e}")
+            logger.error(f"Error loading checkpoint , {e}")
             return [], [], pd.read_csv(csv_file)
 
+    def cleanup(self, csv_file):
+        for path in [self.get_checkpoint_path(csv_file), self.get_temp_path(csv_file)]:
+            if path.exists():
+                try:
+                    path.unlink()
+                    logger.info(f"Removed {path}")
+                except Exception as e:
+                    logger.warning(f"Could not remove {path} , {e}")
+
 class ModelManager:
-    def __init__(self, base_dir: str, device: str):
+    def __init__(self, base_dir: str, device_map: str = "auto"):
         self.base_dir = base_dir
-        self.device = device
+        self.device_map = device_map
         self.model = None
         self.tokenizer = None
         self.name = None
         self.lock = threading.Lock()
 
-    def load(self, model_dir: str):
+    def load_model(self, subdir: str):
         with self.lock:
-            path = os.path.join(self.base_dir, model_dir)
-            if self.name != model_dir:
-                if self.model is not None:
-                    del self.model
-                    del self.tokenizer
-                    gc.collect()
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-                logger.info(f"Loading {path}")
-                self.tokenizer = AutoTokenizer.from_pretrained(path)
+            path = os.path.join(self.base_dir, subdir)
+            if self.name != subdir:
+                if self.model:
+                    self._unload()
+                logger.info(f"Loading model from {path}")
+                self.tokenizer = AutoTokenizer.from_pretrained(path, trust_remote_code=True)
                 if self.tokenizer.pad_token is None:
                     self.tokenizer.pad_token = self.tokenizer.eos_token
                 self.model = AutoModelForCausalLM.from_pretrained(
                     path,
                     torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+                    device_map=self.device_map,
                     trust_remote_code=True,
                     low_cpu_mem_usage=True
                 )
-                self.model.to(self.device)
-                self.name = model_dir
+                self.name = subdir
             return self.model, self.tokenizer
 
-    def unload(self):
-        if self.model is not None:
-            del self.model
-            del self.tokenizer
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            self.model = None
-            self.tokenizer = None
-            self.name = None
+    def _unload(self):
+        del self.model
+        del self.tokenizer
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        self.name = None
 
+def generate_response(model, tokenizer, prompt, max_length, temperature):
+    inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=max_length//2)
+    device = next(model.parameters()).device
+    inputs = {k: v.to(device) for k, v in inputs.items()}
+    out = model.generate(
+        **inputs,
+        max_length=max_length,
+        temperature=temperature,
+        do_sample=True,
+        pad_token_id=tokenizer.eos_token_id,
+        num_return_sequences=1,
+        early_stopping=True
+    )
+    text = tokenizer.decode(out[0], skip_special_tokens=True)
+    return text[len(prompt):].strip()
 
-def generate_response(model, tokenizer, prompt: str, max_len: int, temp: float) -> str:
-    inputs = tokenizer(prompt, return_tensors='pt', truncation=True, max_length=max_len//2)
-    dev = next(model.parameters()).device
-    inputs = {k: v.to(dev) for k,v in inputs.items()}
-    out = model.generate(**inputs, max_length=max_len, temperature=temp, do_sample=True,
-                          pad_token_id=tokenizer.eos_token_id, num_return_sequences=1)
-    txt = tokenizer.decode(out[0], skip_special_tokens=True)
-    return txt[len(prompt):].strip()
-
-
-def process_model(csv_file, base_dir, model_dir, model_name, max_len, temp, device):
-    mgr = ModelManager(base_dir, device)
-    model, tokenizer = mgr.load(model_dir)
+def process_csv_with_model(csv_file, base_dir, subdir, model_name, max_length, temperature, device):
     df = pd.read_csv(csv_file)
-    results = []
-    for p in df['prompt']:
-        if pd.isna(p):
-            results.append('')
+    if "prompt" not in df:
+        logger.error(f"No prompt column in {csv_file}")
+        return df
+    mgr = ModelManager(base_dir, device)
+    model, tokenizer = mgr.load_model(subdir)
+
+    total = len(df)
+    col = f"{model_name.replace('/', '_').replace('-', '_')}_cont"
+    responses = [None] * total
+    logger.info(f"Starting {total} inferences for {model_name}")
+    start = time.time()
+
+    for i, prompt in enumerate(df["prompt"]):
+        if pd.isna(prompt):
+            responses[i] = ""
         else:
-            results.append(generate_response(model, tokenizer, str(p), max_len, temp))
-    out_df = pd.DataFrame({'prompt': df['prompt'], f'{model_name}_continuation': results})
-    output_file = Path(csv_file).with_suffix('').stem + f'_{model_name.replace('/', '_')}.csv'
-    out_df.to_csv(output_file, index=False)
-    logger.info(f"Saved {output_file}")
-    return model_name
+            responses[i] = generate_response(model, tokenizer, str(prompt), max_length, temperature)
 
+        if (i + 1) % 10 == 0 or (i + 1) == total:
+            elapsed = time.time() - start
+            rate = (i + 1) / elapsed if elapsed > 0 else 0
+            remain = (total - (i + 1)) / rate if rate > 0 else float("inf")
+            e_str = time.strftime("%H:%M:%S", time.gmtime(elapsed))
+            r_str = time.strftime("%H:%M:%S", time.gmtime(remain))
+            logger.info(
+                f"{model_name} progress {i + 1}/{total} inferences , elapsed {e_str} , eta {r_str}"
+            )
 
-def process_single_csv(args):
-    csv_file, base_dir, models, max_len, temp, resume = args
-    logger.info(f"Start {csv_file}")
-    cp = CheckpointManager()
-    done, failed, _ = cp.load(csv_file) if resume else ([], [], None)
-    to_run = {k:v for k,v in models.items() if k not in done}
-    if not to_run:
-        logger.info("Nothing to do")
-        return csv_file, done
-    gpus = torch.cuda.device_count() if torch.cuda.is_available() else 1
-    futures = {}
-    with ThreadPoolExecutor(max_workers=min(len(to_run), gpus)) as exe:
-        for i,(name,md) in enumerate(to_run.items()):
-            dev = f"cuda:{i % gpus}" if torch.cuda.is_available() else 'cpu'
-            futures[exe.submit(process_model, csv_file, base_dir, md, name, max_len, temp, dev)] = name
-        for fut in as_completed(futures):
-            model_name = futures[fut]
-            try:
-                finished = fut.result()
-                done.append(finished)
-                if finished in failed:
-                    failed.remove(finished)
-                logger.info(f"Done {finished}")
-            except Exception as e:
-                failed.append(model_name)
-                logger.error(f"Failed {model_name}: {e}")
-            cp.save(csv_file, done, failed, pd.DataFrame())
-    return csv_file, done
-
+    df[col] = responses
+    out_name = f"{Path(csv_file).stem}_{model_name.replace('/', '_')}.csv"
+    df.to_csv(Path(csv_file).parent / out_name, index=False)
+    logger.info(f"Wrote results to {out_name}")
+    return None
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('csv_files', nargs='+')
-    parser.add_argument('--model-dir', required=True)
-    parser.add_argument('--models', nargs='+', default=['all'])
-    parser.add_argument('--max-length', type=int, default=512)
-    parser.add_argument('--temperature', type=float, default=0.7)
-    parser.add_argument('--resume', action='store_true')
+    parser = argparse.ArgumentParser(description="Run inference on CSVs")
+    parser.add_argument("csv_files", nargs="+")
+    parser.add_argument("--model-dir", required=True)
+    parser.add_argument("--models", nargs="+", default=["all"])
+    parser.add_argument("--max-length", type=int, default=512)
+    parser.add_argument("--temperature", type=float, default=0.7)
+    parser.add_argument("--device", default="auto")
+    parser.add_argument("--max-workers", type=int, default=4)
+    parser.add_argument("--resume", action="store_true")
     args = parser.parse_args()
-    models = MODEL_TO_DIR if 'all' in args.models else {k:v for k,v in MODEL_TO_DIR.items() if k in args.models}
-    available = {k:v for k,v in models.items() if os.path.exists(os.path.join(args.model_dir, v))}
-    tasks = [(cf, args.model_dir, available, args.max_length, args.temperature, args.resume) for cf in args.csv_files]
-    for t in tasks:
-        process_single_csv(t)
 
-if __name__ == '__main__':
+    if "all" in args.models:
+        sel = MODEL_TO_DIR
+    else:
+        sel = {k: v for k, v in MODEL_TO_DIR.items() if k in args.models}
+
+    with ThreadPoolExecutor(max_workers=min(len(sel), args.max_workers)) as exe:
+        futures = []
+        for csv in args.csv_files:
+            for model_name, subdir in sel.items():
+                futures.append(
+                    exe.submit(
+                        process_csv_with_model,
+                        csv, args.model_dir, subdir, model_name,
+                        args.max_length, args.temperature, args.device
+                    )
+                )
+        for f in futures:
+            f.result()
+
+if __name__ == "__main__":
     main()
