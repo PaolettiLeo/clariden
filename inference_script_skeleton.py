@@ -9,16 +9,68 @@ import logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+def check_gpu_resources():
+    """Check and log GPU availability and resources"""
+    logger.info("=== GPU Resource Check ===")
+    
+    # Check if CUDA is available
+    cuda_available = torch.cuda.is_available()
+    logger.info(f"CUDA available: {cuda_available}")
+    
+    if cuda_available:
+        # Get number of GPUs
+        gpu_count = torch.cuda.device_count()
+        logger.info(f"Number of GPUs: {gpu_count}")
+        
+        # Get current GPU
+        current_device = torch.cuda.current_device()
+        logger.info(f"Current GPU device: {current_device}")
+        
+        # Check each GPU
+        for i in range(gpu_count):
+            gpu_name = torch.cuda.get_device_name(i)
+            gpu_memory = torch.cuda.get_device_properties(i).total_memory / (1024**3)  # GB
+            logger.info(f"GPU {i}: {gpu_name} ({gpu_memory:.1f} GB)")
+            
+            # Get memory usage
+            torch.cuda.set_device(i)
+            allocated = torch.cuda.memory_allocated(i) / (1024**3)
+            cached = torch.cuda.memory_reserved(i) / (1024**3)
+            logger.info(f"  Memory allocated: {allocated:.2f} GB")
+            logger.info(f"  Memory cached: {cached:.2f} GB")
+            logger.info(f"  Memory free: {gpu_memory - cached:.2f} GB")
+        
+        # Reset to original device
+        torch.cuda.set_device(current_device)
+        
+    else:
+        logger.info("No CUDA GPUs available - will use CPU")
+    
+    logger.info("=== End GPU Check ===")
+    return cuda_available
+
 def generate_response(model, tokenizer, prompt: str, max_length: int = 512, 
                      temperature: float = 0.7) -> str:
     """Generate response from a model given a prompt"""
     try:
+        # Get model device
+        device = next(model.parameters()).device
+        logger.info(f"Model is on device: {device}")
+        
+        # Check GPU memory before generation
+        if torch.cuda.is_available() and device.type == 'cuda':
+            gpu_id = device.index if device.index is not None else 0
+            before_allocated = torch.cuda.memory_allocated(gpu_id) / (1024**3)
+            before_cached = torch.cuda.memory_reserved(gpu_id) / (1024**3)
+            logger.info(f"GPU memory before generation - Allocated: {before_allocated:.2f}GB, Cached: {before_cached:.2f}GB")
+        
         # Tokenize input
         inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=max_length//2)
+        logger.info(f"Input tokens shape: {inputs['input_ids'].shape}")
         
         # Move to same device as model
-        device = next(model.parameters()).device
         inputs = {k: v.to(device) for k, v in inputs.items()}
+        logger.info(f"Inputs moved to device: {device}")
         
         # Generate
         with torch.no_grad():
@@ -32,6 +84,16 @@ def generate_response(model, tokenizer, prompt: str, max_length: int = 512,
                 early_stopping=True
             )
         
+        logger.info(f"Generated tokens shape: {outputs.shape}")
+        
+        # Check GPU memory after generation
+        if torch.cuda.is_available() and device.type == 'cuda':
+            after_allocated = torch.cuda.memory_allocated(gpu_id) / (1024**3)
+            after_cached = torch.cuda.memory_reserved(gpu_id) / (1024**3)
+            logger.info(f"GPU memory after generation - Allocated: {after_allocated:.2f}GB, Cached: {after_cached:.2f}GB")
+            memory_diff = after_allocated - before_allocated
+            logger.info(f"Memory difference: {memory_diff:.2f}GB")
+        
         # Decode response
         full_response = tokenizer.decode(outputs[0], skip_special_tokens=True)
         
@@ -42,10 +104,13 @@ def generate_response(model, tokenizer, prompt: str, max_length: int = 512,
         
     except Exception as e:
         logger.error(f"Error generating response: {str(e)}")
+        # If it's a GPU memory error, provide specific info
+        if "CUDA out of memory" in str(e):
+            logger.error("GPU out of memory! Try reducing --max-length or using --device cpu")
         return f"ERROR: {str(e)}"
 
 def main():
-    parser = argparse.ArgumentParser(description="Simple model inference test")
+    parser = argparse.ArgumentParser(description="Simple model inference test with GPU monitoring")
     parser.add_argument("csv_file", help="CSV file to process")
     parser.add_argument("--model-dir", type=str, required=True, 
                         help="Path to the model directory")
@@ -56,9 +121,41 @@ def main():
     parser.add_argument("--temperature", type=float, default=0.7,
                         help="Temperature for text generation")
     parser.add_argument("--device", type=str, default="auto",
-                        help="Device to use (auto, cpu, cuda, etc.)")
+                        help="Device to use (auto, cpu, cuda, cuda:0, etc.)")
+    parser.add_argument("--test-only", action="store_true",
+                        help="Only test GPU resources and model loading, don't process CSV")
     
     args = parser.parse_args()
+    
+    # Check GPU resources first
+    cuda_available = check_gpu_resources()
+    
+    # Determine actual device to use
+    if args.device == "auto":
+        if cuda_available:
+            actual_device = "cuda"
+            logger.info("Auto-selected device: CUDA")
+        else:
+            actual_device = "cpu"
+            logger.info("Auto-selected device: CPU")
+    else:
+        actual_device = args.device
+        logger.info(f"User-specified device: {actual_device}")
+    
+    # Test device compatibility
+    try:
+        if actual_device.startswith("cuda") and not cuda_available:
+            logger.error(f"CUDA device requested but CUDA not available!")
+            return
+        
+        # Test tensor creation on device
+        test_tensor = torch.randn(10, 10).to(actual_device)
+        logger.info(f"Successfully created test tensor on {test_tensor.device}")
+        del test_tensor
+        
+    except Exception as e:
+        logger.error(f"Error with device {actual_device}: {str(e)}")
+        return
     
     # Check if CSV file exists
     if not os.path.exists(args.csv_file):
