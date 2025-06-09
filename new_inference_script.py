@@ -106,27 +106,16 @@ class ModelManager:
 
                 logger.info(f"Loading model from {path}")
 
-                # try fast tokenizer first (needed for llama2-hf)
-                try:
-                    self.tokenizer = AutoTokenizer.from_pretrained(
-                        path,
-                        trust_remote_code=True,
-                        use_fast=True
-                    )
-                except Exception as fast_err:
-                    logger.warning(
-                        f"fast tokenizer load failed for {subdir}, falling back to slow, "
-                        f"reason: {fast_err}"
-                    )
-                    self.tokenizer = AutoTokenizer.from_pretrained(
-                        path,
-                        trust_remote_code=True,
-                        use_fast=False
-                    )
-
+                # use the fast Rust backend tokenizer
+                self.tokenizer = AutoTokenizer.from_pretrained(
+                    path,
+                    trust_remote_code=True,
+                    use_fast=True
+                )
                 if self.tokenizer.pad_token is None:
                     self.tokenizer.pad_token = self.tokenizer.eos_token
 
+                # load the causal LM model onto the configured device map
                 self.model = AutoModelForCausalLM.from_pretrained(
                     path,
                     torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
@@ -136,7 +125,8 @@ class ModelManager:
                 )
                 self.name = subdir
 
-            return self.model, self.tokenizer
+        return self.model, self.tokenizer
+
 
     def _unload(self):
         del self.model
