@@ -1,0 +1,274 @@
+import os
+import argparse
+import pandas as pd
+import torch
+from transformers import AutoTokenizer, AutoModelForCausalLM
+from concurrent.futures import ThreadPoolExecutor
+import logging
+import time
+from pathlib import Path
+import gc
+import threading
+import json
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s , %(levelname)s , %(message)s',
+    handlers=[
+        logging.FileHandler("model_inference.log"),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+MODEL_TO_DIR = {
+    #"mistralai/Mistral-7B-v0.1": "mistral-7b-v0.1",
+    "HuggingFaceH4/zephyr-7b-alpha": "zephyr-7b-alpha",
+    "meta-llama/Llama-2-7b-hf": "llama2-7b",
+    "meta-llama/Llama-2-13b-hf": "llama2-13b"
+    #"meta-llama/Llama-2-70b-hf": "llama2-70b",
+    #"EleutherAI/pythia-1b": "pythia-1b",
+    #"EleutherAI/pythia-2.8b": "pythia-2.8b",
+    #"EleutherAI/pythia-6.9b": "pythia-6.9b",
+    #"EleutherAI/pythia-12b": "pythia-12b",
+    #"tiiuae/falcon-7b": "falcon-7b",
+    #"tiiuae/falcon-40b": "falcon-40b",
+    #"ContextualAI/archangel_dpo_pythia2-8b": "archangel-dpo-pythia2-8b",
+    #"ContextualAI/archangel_ppo_pythia2-8b": "archangel-ppo-pythia2-8b"
+}
+
+class CheckpointManager:
+    def __init__(self, checkpoint_dir: str = "checkpoints"):
+        self.checkpoint_dir = Path(checkpoint_dir)
+        self.checkpoint_dir.mkdir(exist_ok=True)
+
+    def get_checkpoint_path(self, csv_file: str) -> Path:
+        name = Path(csv_file).stem
+        return self.checkpoint_dir / f"{name}_checkpoint.json"
+
+    def get_temp_path(self, csv_file: str) -> Path:
+        p = Path(csv_file)
+        return p.parent / f"{p.stem}_temp_progress.csv"
+
+    def save_checkpoint(self, csv_file, completed, failed, df):
+        data = {
+            "csv_file": csv_file,
+            "completed_models": completed,
+            "failed_models": failed,
+            "timestamp": time.time(),
+            "total_rows": len(df)
+        }
+        cp = self.get_checkpoint_path(csv_file)
+        tmp = self.get_temp_path(csv_file)
+        with open(cp, "w") as f:
+            json.dump(data, f, indent=2)
+        df.to_csv(tmp, index=False)
+        logger.info(f"{len(completed)} models done for {csv_file}")
+
+    def load_checkpoint(self, csv_file):
+        cp = self.get_checkpoint_path(csv_file)
+        tmp = self.get_temp_path(csv_file)
+        if not cp.exists() or not tmp.exists():
+            return [], [], pd.read_csv(csv_file)
+        try:
+            with open(cp) as f:
+                data = json.load(f)
+            df = pd.read_csv(tmp)
+            return data.get("completed_models", []), data.get("failed_models", []), df
+        except Exception as e:
+            logger.error(f"Error loading checkpoint , {e}")
+            return [], [], pd.read_csv(csv_file)
+
+    def cleanup(self, csv_file):
+        for path in [self.get_checkpoint_path(csv_file), self.get_temp_path(csv_file)]:
+            if path.exists():
+                try:
+                    path.unlink()
+                    logger.info(f"Removed {path}")
+                except Exception as e:
+                    logger.warning(f"Could not remove {path} , {e}")
+
+
+class ModelManager:
+    def __init__(self, model_path: str, device_map: str = "auto"):
+        self.model_path = model_path
+        self.device_map = device_map
+        self.model = None
+        self.tokenizer = None
+        self.name = Path(model_path).name # Use the model name as identifier
+
+    def load_model(self):
+        # No lock needed here as each ModelManager instance will handle one model
+        # The lock was causing serialization for model loading
+
+        if self.model is None: # Only load if not already loaded
+            logger.info(f"Loading model from {self.model_path}")
+
+            try:
+                self.tokenizer = AutoTokenizer.from_pretrained(
+                    self.model_path,
+                    trust_remote_code=True,
+                    use_fast=True
+                )
+            except Exception as fast_err:
+                logger.warning(
+                    f"fast tokenizer load failed for {self.model_path}, falling back to slow, "
+                    f"reason: {fast_err}"
+                )
+                self.tokenizer = AutoTokenizer.from_pretrained(
+                    self.model_path,
+                    trust_remote_code=True,
+                    use_fast=False
+                )
+
+            if self.tokenizer.pad_token is None:
+                self.tokenizer.pad_token = self.tokenizer.eos_token
+
+            self.model = AutoModelForCausalLM.from_pretrained(
+                self.model_path,
+                torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+                device_map=self.device_map,
+                trust_remote_code=True,
+                low_cpu_mem_usage=True
+            )
+            # No need for self.name tracking anymore since it's one model per manager
+
+        return self.model, self.tokenizer
+
+    def unload(self):
+        if self.model:
+            logger.info(f"Unloading model {self.name}")
+            del self.model
+            del self.tokenizer
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            self.model = None
+            self.tokenizer = None
+
+def generate_response(model, tokenizer, prompt, max_length, temperature):
+    # ... (keep as is) ...
+    inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=max_length//2)
+    device = next(model.parameters()).device
+    inputs = {k: v.to(device) for k, v in inputs.items()}
+    out = model.generate(
+        **inputs,
+        max_length=max_length,
+        temperature=temperature,
+        do_sample=True,
+        pad_token_id=tokenizer.eos_token_id,
+        num_return_sequences=1 # Generate one sequence per prompt
+        # early_stopping=True # Consider removing this if it keeps throwing warnings
+    )
+    text = tokenizer.decode(out[0], skip_special_tokens=True)
+    return text[len(prompt):].strip()
+
+# New global dictionary to hold loaded model managers
+# This ensures a model is loaded once and shared across inferences for that model
+# BE CAREFUL: This assumes the same model instance can be accessed by multiple threads
+# which is generally true for inference, but the underlying torch operations need to be thread-safe.
+# For truly independent parallelization, each thread would ideally load its own model,
+# but that's memory-intensive.
+# A better approach for multi-GPU is to use a queue and a separate process per GPU.
+model_managers = {}
+model_manager_lock = threading.Lock() # To protect model_managers dict
+
+def get_or_load_model_manager(base_dir, subdir, device_map):
+    model_full_path = os.path.join(base_dir, subdir)
+    with model_manager_lock:
+        if model_full_path not in model_managers:
+            manager = ModelManager(model_full_path, device_map)
+            model_managers[model_full_path] = manager
+            # Load the model here, so it's loaded only once per manager
+            manager.load_model()
+        return model_managers[model_full_path]
+
+
+def process_csv_with_model(csv_file, base_dir, subdir, model_name, max_length, temperature, device):
+    df = pd.read_csv(csv_file)
+    if "prompt" not in df.columns: # Changed from "prompt" not in df
+        logger.error(f"No prompt column in {csv_file}")
+        return df
+
+    # Get the shared model manager instance for this model
+    manager = get_or_load_model_manager(base_dir, subdir, device)
+    model, tokenizer = manager.model, manager.tokenizer # Access the already loaded model/tokenizer
+
+    total = len(df)
+    col = f"{model_name.replace('/', '_').replace('-', '_')}_cont"
+    
+    # Check if the column already exists and if we are resuming
+    # This part was not fully implemented in the original code for resuming within the inference loop
+    # For simplicity, we'll assume a fresh run or that the checkpoint logic handles skipped columns.
+    
+    responses = [None] * total
+    logger.info(f"Starting {total} inferences for {model_name}")
+    start = time.time()
+
+    for i, prompt in enumerate(df["prompt"]):
+        if pd.isna(prompt):
+            responses[i] = ""
+        else:
+            responses[i] = generate_response(model, tokenizer, str(prompt), max_length, temperature)
+
+        if (i + 1) % 10 == 0 or (i + 1) == total:
+            elapsed = time.time() - start
+            rate = (i + 1) / elapsed if elapsed > 0 else 0
+            remain = (total - (i + 1)) / rate if rate > 0 else float("inf")
+            e_str = time.strftime("%H:%M:%S", time.gmtime(elapsed))
+            r_str = time.strftime("%H:%M:%S", time.gmtime(remain))
+            logger.info(
+                f"{model_name} progress {i + 1}/{total} inferences , elapsed {e_str} , eta {r_str}"
+            )
+
+    df[col] = responses
+    out_name = f"{Path(csv_file).stem}_{model_name.replace('/', '_')}.csv"
+    df.to_csv(Path(csv_file).parent / out_name, index=False)
+    logger.info(f"Wrote results to {out_name}")
+    return None
+
+def main():
+    parser = argparse.ArgumentParser(description="Run inference on CSVs")
+    parser.add_argument("csv_files", nargs="+")
+    parser.add_argument("--model-dir", required=True)
+    parser.add_argument("--models", nargs="+", default=["all"])
+    parser.add_argument("--max-length", type=int, default=512)
+    parser.add_argument("--temperature", type=float, default=0.7)
+    parser.add_argument("--device", default="auto")
+    parser.add_argument("--max-workers", type=int, default=1) # Reduced max_workers for this scenario
+    parser.add_argument("--resume", action="store_true") # CheckpointManager not used directly in this refactor example
+    args = parser.parse_args()
+
+    if "all" in args.models:
+        sel = MODEL_TO_DIR
+    else:
+        sel = {k: v for k, v in MODEL_TO_DIR.items() if k in args.models}
+
+    # Initialize all model managers and load models upfront
+    # This might load multiple models to GPU if device_map="auto" works and there's enough VRAM
+    # Or it will fail if not enough memory.
+    for model_name, subdir in sel.items():
+        get_or_load_model_manager(args.model_dir, subdir, args.device)
+        
+    # The ThreadPoolExecutor will now only run inference on already loaded models
+    # Each thread will get a reference to the pre-loaded model from model_managers global dict
+    with ThreadPoolExecutor(max_workers=min(len(sel), args.max_workers)) as exe:
+        futures = []
+        for csv in args.csv_files:
+            for model_name, subdir in sel.items():
+                futures.append(
+                    exe.submit(
+                        process_csv_with_model,
+                        csv, args.model_dir, subdir, model_name,
+                        args.max_length, args.temperature, args.device
+                    )
+                )
+        for f in futures:
+            f.result() # Wait for all futures to complete
+
+    # Unload all models after all inferences are done
+    for manager in model_managers.values():
+        manager.unload()
+
+if __name__ == "__main__":
+    main()
